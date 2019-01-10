@@ -11,10 +11,10 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
-	"time"
 
 	"github.com/hashicorp/terraform/communicator"
 	"github.com/hashicorp/terraform/communicator/remote"
@@ -86,6 +86,7 @@ type provisionFn func(terraform.UIOutput, communicator.Communicator) error
 
 type provisioner struct {
 	Attributes            map[string]interface{}
+	Channel               string
 	ClientOptions         []string
 	DisableReporting      bool
 	Environment           string
@@ -148,6 +149,11 @@ func Provisioner() terraform.ResourceProvisioner {
 			"attributes_json": &schema.Schema{
 				Type:     schema.TypeString,
 				Optional: true,
+			},
+			"channel": &schema.Schema{
+				Type:     schema.TypeString,
+				Optional: true,
+				Default:  "stable",
 			},
 			"client_options": &schema.Schema{
 				Type:     schema.TypeList,
@@ -256,16 +262,17 @@ func Provisioner() terraform.ResourceProvisioner {
 // TODO: Support context cancelling (Provisioner Stop)
 func applyFn(ctx context.Context) error {
 	o := ctx.Value(schema.ProvOutputKey).(terraform.UIOutput)
+	s := ctx.Value(schema.ProvRawStateKey).(*terraform.InstanceState)
 	d := ctx.Value(schema.ProvConfigDataKey).(*schema.ResourceData)
 
-	// Decode the raw config for this provisioner
+	// Decode the provisioner config
 	p, err := decodeConfig(d)
 	if err != nil {
 		return err
 	}
 
 	if p.OSType == "" {
-		switch t := d.State().Ephemeral.ConnInfo["type"]; t {
+		switch t := s.Ephemeral.ConnInfo["type"]; t {
 		case "ssh", "": // The default connection type is ssh, so if the type is empty assume ssh
 			p.OSType = "linux"
 		case "winrm":
@@ -285,7 +292,7 @@ func applyFn(ctx context.Context) error {
 		p.generateClientKey = p.generateClientKeyFunc(linuxKnifeCmd, linuxConfDir, linuxNoOutput)
 		p.configureVaults = p.configureVaultsFunc(linuxGemCmd, linuxKnifeCmd, linuxConfDir)
 		p.runChefClient = p.runChefClientFunc(linuxChefCmd, linuxConfDir)
-		p.useSudo = !p.PreventSudo && d.State().Ephemeral.ConnInfo["user"] != "root"
+		p.useSudo = !p.PreventSudo && s.Ephemeral.ConnInfo["user"] != "root"
 	case "windows":
 		p.cleanupUserKeyCmd = fmt.Sprintf("cd %s && del /F /Q %s", windowsConfDir, p.UserName+".pem")
 		p.createConfigFiles = p.windowsCreateConfigFiles
@@ -300,13 +307,16 @@ func applyFn(ctx context.Context) error {
 	}
 
 	// Get a new communicator
-	comm, err := communicator.New(d.State())
+	comm, err := communicator.New(s)
 	if err != nil {
 		return err
 	}
 
+	retryCtx, cancel := context.WithTimeout(ctx, comm.Timeout())
+	defer cancel()
+
 	// Wait and retry until we establish the connection
-	err = retryFunc(comm.Timeout(), func() error {
+	err = communicator.Retry(retryCtx, func() error {
 		return comm.Connect(o)
 	})
 	if err != nil {
@@ -368,21 +378,31 @@ func applyFn(ctx context.Context) error {
 	return nil
 }
 
-func validateFn(d *schema.ResourceData) (ws []string, es []error) {
-	p, err := decodeConfig(d)
-	if err != nil {
-		es = append(es, err)
-		return ws, es
+func validateFn(c *terraform.ResourceConfig) (ws []string, es []error) {
+	usePolicyFile := false
+	if usePolicyFileRaw, ok := c.Get("use_policyfile"); ok {
+		switch usePolicyFileRaw := usePolicyFileRaw.(type) {
+		case bool:
+			usePolicyFile = usePolicyFileRaw
+		case string:
+			usePolicyFileBool, err := strconv.ParseBool(usePolicyFileRaw)
+			if err != nil {
+				return ws, append(es, errors.New("\"use_policyfile\" must be a boolean"))
+			}
+			usePolicyFile = usePolicyFileBool
+		default:
+			return ws, append(es, errors.New("\"use_policyfile\" must be a boolean"))
+		}
 	}
 
-	if !p.UsePolicyfile && p.RunList == nil {
-		es = append(es, errors.New("Key not found: run_list"))
+	if !usePolicyFile && !c.IsSet("run_list") {
+		es = append(es, errors.New("\"run_list\": required field is not set"))
 	}
-	if p.UsePolicyfile && p.PolicyName == "" {
-		es = append(es, errors.New("Policyfile enabled but key not found: policy_name"))
+	if usePolicyFile && !c.IsSet("policy_name") {
+		es = append(es, errors.New("using policyfile, but \"policy_name\" not set"))
 	}
-	if p.UsePolicyfile && p.PolicyGroup == "" {
-		es = append(es, errors.New("Policyfile enabled but key not found: policy_group"))
+	if usePolicyFile && !c.IsSet("policy_group") {
+		es = append(es, errors.New("using policyfile, but \"policy_group\" not set"))
 	}
 
 	return ws, es
@@ -436,7 +456,7 @@ func (p *provisioner) deployConfigFiles(o terraform.UIOutput, comm communicator.
 	// Check if the run_list was also in the attributes and if so log a warning
 	// that it will be overwritten with the value of the run_list argument.
 	if _, found := fb["run_list"]; found {
-		log.Printf("[WARNING] Found a 'run_list' specified in the configured attributes! " +
+		log.Printf("[WARN] Found a 'run_list' specified in the configured attributes! " +
 			"This value will be overwritten by the value of the `run_list` argument!")
 	}
 
@@ -558,6 +578,25 @@ func (p *provisioner) configureVaultsFunc(gemCmd string, knifeCmd string, confDi
 			path.Join(confDir, p.UserName+".pem"),
 		)
 
+		// if client gets recreated, remove (old) client (with old keys) from vaults/items
+		// otherwise, the (new) client (with new keys) will not be able to decrypt the vault
+		if p.RecreateClient {
+			for vault, items := range p.Vaults {
+				for _, item := range items {
+					deleteCmd := fmt.Sprintf("%s vault remove %s %s -C \"%s\" -M client %s",
+						knifeCmd,
+						vault,
+						item,
+						p.NodeName,
+						options,
+					)
+					if err := p.runCommand(o, comm, deleteCmd); err != nil {
+						return err
+					}
+				}
+			}
+		}
+
 		for vault, items := range p.Vaults {
 			for _, item := range items {
 				updateCmd := fmt.Sprintf("%s vault update %s %s -C %s -M client %s",
@@ -647,10 +686,10 @@ func (p *provisioner) runCommand(o terraform.UIOutput, comm communicator.Communi
 
 	outR, outW := io.Pipe()
 	errR, errW := io.Pipe()
-	outDoneCh := make(chan struct{})
-	errDoneCh := make(chan struct{})
-	go p.copyOutput(o, outR, outDoneCh)
-	go p.copyOutput(o, errR, errDoneCh)
+	go p.copyOutput(o, outR)
+	go p.copyOutput(o, errR)
+	defer outW.Close()
+	defer errW.Close()
 
 	cmd := &remote.Cmd{
 		Command: command,
@@ -663,49 +702,23 @@ func (p *provisioner) runCommand(o terraform.UIOutput, comm communicator.Communi
 		return fmt.Errorf("Error executing command %q: %v", cmd.Command, err)
 	}
 
-	cmd.Wait()
-	if cmd.ExitStatus != 0 {
-		err = fmt.Errorf(
-			"Command %q exited with non-zero exit status: %d", cmd.Command, cmd.ExitStatus)
+	if err := cmd.Wait(); err != nil {
+		return err
 	}
 
-	// Wait for output to clean up
-	outW.Close()
-	errW.Close()
-	<-outDoneCh
-	<-errDoneCh
-
-	return err
+	return nil
 }
 
-func (p *provisioner) copyOutput(o terraform.UIOutput, r io.Reader, doneCh chan<- struct{}) {
-	defer close(doneCh)
+func (p *provisioner) copyOutput(o terraform.UIOutput, r io.Reader) {
 	lr := linereader.New(r)
 	for line := range lr.Ch {
 		o.Output(line)
 	}
 }
 
-// retryFunc is used to retry a function for a given duration
-func retryFunc(timeout time.Duration, f func() error) error {
-	finish := time.After(timeout)
-	for {
-		err := f()
-		if err == nil {
-			return nil
-		}
-		log.Printf("Retryable error: %v", err)
-
-		select {
-		case <-finish:
-			return err
-		case <-time.After(3 * time.Second):
-		}
-	}
-}
-
 func decodeConfig(d *schema.ResourceData) (*provisioner, error) {
 	p := &provisioner{
+		Channel:               d.Get("channel").(string),
 		ClientOptions:         getStringList(d.Get("client_options")),
 		DisableReporting:      d.Get("disable_reporting").(bool),
 		Environment:           d.Get("environment").(string),
@@ -782,18 +795,18 @@ func decodeConfig(d *schema.ResourceData) (*provisioner, error) {
 }
 
 func getStringList(v interface{}) []string {
-	if v == nil {
-		return nil
-	}
-	switch l := v.(type) {
-	case []string:
-		return l
+	var result []string
+
+	switch v := v.(type) {
+	case nil:
+		return result
 	case []interface{}:
-		arr := make([]string, len(l))
-		for i, x := range l {
-			arr[i] = x.(string)
+		for _, vv := range v {
+			if vv, ok := vv.(string); ok {
+				result = append(result, vv)
+			}
 		}
-		return arr
+		return result
 	default:
 		panic(fmt.Sprintf("Unsupported type: %T", v))
 	}

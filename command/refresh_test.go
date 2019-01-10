@@ -2,6 +2,8 @@ package command
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -9,9 +11,18 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hashicorp/terraform/helper/copy"
-	"github.com/hashicorp/terraform/terraform"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/mitchellh/cli"
+	"github.com/zclconf/go-cty/cty"
+
+	"github.com/hashicorp/terraform/addrs"
+	"github.com/hashicorp/terraform/configs/configschema"
+	"github.com/hashicorp/terraform/helper/copy"
+	"github.com/hashicorp/terraform/providers"
+	"github.com/hashicorp/terraform/states"
+	"github.com/hashicorp/terraform/states/statefile"
+	"github.com/hashicorp/terraform/states/statemgr"
+	"github.com/hashicorp/terraform/terraform"
 )
 
 func TestRefresh(t *testing.T) {
@@ -22,13 +33,18 @@ func TestRefresh(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
-	p.RefreshFn = nil
-	p.RefreshReturn = &terraform.InstanceState{ID: "yes"}
+	p.GetSchemaReturn = refreshFixtureSchema()
+	p.ReadResourceFn = nil
+	p.ReadResourceResponse = providers.ReadResourceResponse{
+		NewState: cty.ObjectVal(map[string]cty.Value{
+			"id": cty.StringVal("yes"),
+		}),
+	}
 
 	args := []string{
 		"-state", statePath,
@@ -38,8 +54,8 @@ func TestRefresh(t *testing.T) {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
 	}
 
-	if !p.RefreshCalled {
-		t.Fatal("refresh should be called")
+	if !p.ReadResourceCalled {
+		t.Fatal("ReadResource should have been called")
 	}
 
 	f, err := os.Open(statePath)
@@ -47,13 +63,13 @@ func TestRefresh(t *testing.T) {
 		t.Fatalf("err: %s", err)
 	}
 
-	newState, err := terraform.ReadState(f)
+	newStateFile, err := statefile.Read(f)
 	f.Close()
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
-	actual := strings.TrimSpace(newState.String())
+	actual := strings.TrimSpace(newStateFile.State.String())
 	expected := strings.TrimSpace(testRefreshStr)
 	if actual != expected {
 		t.Fatalf("bad:\n\n%s", actual)
@@ -71,13 +87,17 @@ func TestRefresh_empty(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
-	p.RefreshFn = nil
-	p.RefreshReturn = &terraform.InstanceState{ID: "yes"}
+	p.ReadResourceFn = nil
+	p.ReadResourceResponse = providers.ReadResourceResponse{
+		NewState: cty.ObjectVal(map[string]cty.Value{
+			"id": cty.StringVal("yes"),
+		}),
+	}
 
 	args := []string{
 		td,
@@ -86,8 +106,8 @@ func TestRefresh_empty(t *testing.T) {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
 	}
 
-	if p.RefreshCalled {
-		t.Fatal("refresh should not be called")
+	if p.ReadResourceCalled {
+		t.Fatal("ReadResource should not have been called")
 	}
 }
 
@@ -95,7 +115,7 @@ func TestRefresh_lockedState(t *testing.T) {
 	state := testState()
 	statePath := testStateFile(t, state)
 
-	unlock, err := testLockState("./testdata", statePath)
+	unlock, err := testLockState(testDataDir, statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,13 +125,18 @@ func TestRefresh_lockedState(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
-	p.RefreshFn = nil
-	p.RefreshReturn = &terraform.InstanceState{ID: "yes"}
+	p.GetSchemaReturn = refreshFixtureSchema()
+	p.ReadResourceFn = nil
+	p.ReadResourceResponse = providers.ReadResourceResponse{
+		NewState: cty.ObjectVal(map[string]cty.Value{
+			"id": cty.StringVal("yes"),
+		}),
+	}
 
 	args := []string{
 		"-state", statePath,
@@ -145,13 +170,18 @@ func TestRefresh_cwd(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
-	p.RefreshFn = nil
-	p.RefreshReturn = &terraform.InstanceState{ID: "yes"}
+	p.GetSchemaReturn = refreshFixtureSchema()
+	p.ReadResourceFn = nil
+	p.ReadResourceResponse = providers.ReadResourceResponse{
+		NewState: cty.ObjectVal(map[string]cty.Value{
+			"id": cty.StringVal("yes"),
+		}),
+	}
 
 	args := []string{
 		"-state", statePath,
@@ -160,8 +190,8 @@ func TestRefresh_cwd(t *testing.T) {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
 	}
 
-	if !p.RefreshCalled {
-		t.Fatal("refresh should be called")
+	if !p.ReadResourceCalled {
+		t.Fatal("ReadResource should have been called")
 	}
 
 	f, err := os.Open(statePath)
@@ -169,13 +199,13 @@ func TestRefresh_cwd(t *testing.T) {
 		t.Fatalf("err: %s", err)
 	}
 
-	newState, err := terraform.ReadState(f)
+	newStateFile, err := statefile.Read(f)
 	f.Close()
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
-	actual := strings.TrimSpace(newState.String())
+	actual := strings.TrimSpace(newStateFile.State.String())
 	expected := strings.TrimSpace(testRefreshCwdStr)
 	if actual != expected {
 		t.Fatalf("bad:\n\n%s", actual)
@@ -187,20 +217,15 @@ func TestRefresh_defaultState(t *testing.T) {
 
 	// Write the state file in a temporary directory with the
 	// default filename.
-	td, err := ioutil.TempDir("", "tf")
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	statePath := filepath.Join(td, DefaultStateFilename)
+	statePath := testStateFile(t, originalState)
 
-	f, err := os.Create(statePath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
+	localState := statemgr.NewFilesystem(statePath)
+	if err := localState.RefreshState(); err != nil {
+		t.Fatal(err)
 	}
-	err = terraform.WriteState(originalState, f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
+	s := localState.State()
+	if s == nil {
+		t.Fatal("empty test state")
 	}
 
 	// Change to that directory
@@ -217,129 +242,18 @@ func TestRefresh_defaultState(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
-	p.RefreshFn = nil
-	p.RefreshReturn = newInstanceState("yes")
-
-	args := []string{
-		testFixturePath("refresh"),
+	p.GetSchemaReturn = refreshFixtureSchema()
+	p.ReadResourceFn = nil
+	p.ReadResourceResponse = providers.ReadResourceResponse{
+		NewState: cty.ObjectVal(map[string]cty.Value{
+			"id": cty.StringVal("yes"),
+		}),
 	}
-	if code := c.Run(args); code != 0 {
-		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
-	}
-
-	if !p.RefreshCalled {
-		t.Fatal("refresh should be called")
-	}
-
-	f, err = os.Open(statePath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	newState, err := terraform.ReadState(f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	actual := newState.RootModule().Resources["test_instance.foo"].Primary
-	expected := p.RefreshReturn
-	if !reflect.DeepEqual(actual, expected) {
-		t.Logf("expected:\n%#v", expected)
-		t.Fatalf("bad:\n%#v", actual)
-	}
-
-	f, err = os.Open(statePath + DefaultBackupExtension)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	backupState, err := terraform.ReadState(f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	actual = backupState.RootModule().Resources["test_instance.foo"].Primary
-	expected = originalState.RootModule().Resources["test_instance.foo"].Primary
-	if !reflect.DeepEqual(actual, expected) {
-		t.Fatalf("bad: %#v", actual)
-	}
-}
-
-func TestRefresh_futureState(t *testing.T) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if err := os.Chdir(testFixturePath("refresh")); err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	defer os.Chdir(cwd)
-
-	state := testState()
-	state.TFVersion = "99.99.99"
-	statePath := testStateFile(t, state)
-
-	p := testProvider()
-	ui := new(cli.MockUi)
-	c := &RefreshCommand{
-		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
-		},
-	}
-
-	args := []string{
-		"-state", statePath,
-	}
-	if code := c.Run(args); code == 0 {
-		t.Fatal("should fail")
-	}
-
-	if p.RefreshCalled {
-		t.Fatal("refresh should not be called")
-	}
-
-	f, err := os.Open(statePath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	newState, err := terraform.ReadState(f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	actual := strings.TrimSpace(newState.String())
-	expected := strings.TrimSpace(state.String())
-	if actual != expected {
-		t.Fatalf("bad:\n\n%s", actual)
-	}
-}
-
-func TestRefresh_pastState(t *testing.T) {
-	state := testState()
-	state.TFVersion = "0.1.0"
-	statePath := testStateFile(t, state)
-
-	p := testProvider()
-	ui := new(cli.MockUi)
-	c := &RefreshCommand{
-		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
-		},
-	}
-
-	p.RefreshFn = nil
-	p.RefreshReturn = &terraform.InstanceState{ID: "yes"}
 
 	args := []string{
 		"-state", statePath,
@@ -349,29 +263,28 @@ func TestRefresh_pastState(t *testing.T) {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
 	}
 
-	if !p.RefreshCalled {
-		t.Fatal("refresh should be called")
+	if !p.ReadResourceCalled {
+		t.Fatal("ReadResource should have been called")
 	}
 
-	f, err := os.Open(statePath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
+	newState := testStateRead(t, statePath)
+
+	actual := newState.RootModule().Resources["test_instance.foo"].Instances[addrs.NoKey].Current
+	expected := &states.ResourceInstanceObjectSrc{
+		Status:       states.ObjectReady,
+		AttrsJSON:    []byte("{\n            \"ami\": null,\n            \"id\": \"yes\"\n          }"),
+		Dependencies: []addrs.Referenceable{},
+	}
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("wrong new object\ngot:  %swant: %s", spew.Sdump(actual), spew.Sdump(expected))
 	}
 
-	newState, err := terraform.ReadState(f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
+	backupState := testStateRead(t, statePath+DefaultBackupExtension)
 
-	actual := strings.TrimSpace(newState.String())
-	expected := strings.TrimSpace(testRefreshStr)
-	if actual != expected {
-		t.Fatalf("bad:\n\n%s", actual)
-	}
-
-	if newState.TFVersion != terraform.Version {
-		t.Fatalf("bad:\n\n%s", newState.TFVersion)
+	actual = backupState.RootModule().Resources["test_instance.foo"].Instances[addrs.NoKey].Current
+	expected = originalState.RootModule().Resources["test_instance.foo"].Instances[addrs.NoKey].Current
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("wrong new object\ngot:  %swant: %s", spew.Sdump(actual), spew.Sdump(expected))
 	}
 }
 
@@ -380,7 +293,7 @@ func TestRefresh_outPath(t *testing.T) {
 	statePath := testStateFile(t, state)
 
 	// Output path
-	outf, err := ioutil.TempFile("", "tf")
+	outf, err := ioutil.TempFile(testingDir, "tf")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -392,13 +305,18 @@ func TestRefresh_outPath(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
-	p.RefreshFn = nil
-	p.RefreshReturn = newInstanceState("yes")
+	p.GetSchemaReturn = refreshFixtureSchema()
+	p.ReadResourceFn = nil
+	p.ReadResourceResponse = providers.ReadResourceResponse{
+		NewState: cty.ObjectVal(map[string]cty.Value{
+			"id": cty.StringVal("yes"),
+		}),
+	}
 
 	args := []string{
 		"-state", statePath,
@@ -409,53 +327,27 @@ func TestRefresh_outPath(t *testing.T) {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
 	}
 
-	f, err := os.Open(statePath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	newState, err := terraform.ReadState(f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
+	newState := testStateRead(t, statePath)
 	if !reflect.DeepEqual(newState, state) {
 		t.Fatalf("bad: %#v", newState)
 	}
 
-	f, err = os.Open(outPath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
+	newState = testStateRead(t, outPath)
+	actual := newState.RootModule().Resources["test_instance.foo"].Instances[addrs.NoKey].Current
+	expected := &states.ResourceInstanceObjectSrc{
+		Status:       states.ObjectReady,
+		AttrsJSON:    []byte("{\n            \"ami\": null,\n            \"id\": \"yes\"\n          }"),
+		Dependencies: []addrs.Referenceable{},
 	}
-
-	newState, err = terraform.ReadState(f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	actual := newState.RootModule().Resources["test_instance.foo"].Primary
-	expected := p.RefreshReturn
 	if !reflect.DeepEqual(actual, expected) {
-		t.Fatalf("bad: %#v", actual)
+		t.Fatalf("wrong new object\ngot:  %swant: %s", spew.Sdump(actual), spew.Sdump(expected))
 	}
 
-	f, err = os.Open(outPath + DefaultBackupExtension)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	backupState, err := terraform.ReadState(f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	actualStr := strings.TrimSpace(backupState.String())
-	expectedStr := strings.TrimSpace(state.String())
-	if actualStr != expectedStr {
-		t.Fatalf("bad:\n\n%s\n\n%s", actualStr, expectedStr)
+	if _, err := os.Stat(outPath + DefaultBackupExtension); !os.IsNotExist(err) {
+		if err != nil {
+			t.Fatalf("failed to test for backup file: %s", err)
+		}
+		t.Fatalf("backup file exists, but it should not because output file did not initially exist")
 	}
 }
 
@@ -467,10 +359,11 @@ func TestRefresh_var(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
+	p.GetSchemaReturn = refreshVarFixtureSchema()
 
 	args := []string{
 		"-var", "foo=bar",
@@ -484,8 +377,8 @@ func TestRefresh_var(t *testing.T) {
 	if !p.ConfigureCalled {
 		t.Fatal("configure should be called")
 	}
-	if p.ConfigureConfig.Config["value"].(string) != "bar" {
-		t.Fatalf("bad: %#v", p.ConfigureConfig.Config)
+	if got, want := p.ConfigureRequest.Config.GetAttr("value"), cty.StringVal("bar"); !want.RawEquals(got) {
+		t.Fatalf("wrong provider configuration\ngot:  %#v\nwant: %#v", got, want)
 	}
 }
 
@@ -497,10 +390,11 @@ func TestRefresh_varFile(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
+	p.GetSchemaReturn = refreshVarFixtureSchema()
 
 	varFilePath := testTempFile(t)
 	if err := ioutil.WriteFile(varFilePath, []byte(refreshVarFile), 0644); err != nil {
@@ -519,8 +413,8 @@ func TestRefresh_varFile(t *testing.T) {
 	if !p.ConfigureCalled {
 		t.Fatal("configure should be called")
 	}
-	if p.ConfigureConfig.Config["value"].(string) != "bar" {
-		t.Fatalf("bad: %#v", p.ConfigureConfig.Config)
+	if got, want := p.ConfigureRequest.Config.GetAttr("value"), cty.StringVal("bar"); !want.RawEquals(got) {
+		t.Fatalf("wrong provider configuration\ngot:  %#v\nwant: %#v", got, want)
 	}
 }
 
@@ -532,10 +426,11 @@ func TestRefresh_varFileDefault(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
+	p.GetSchemaReturn = refreshVarFixtureSchema()
 
 	varFileDir := testTempDir(t)
 	varFilePath := filepath.Join(varFileDir, "terraform.tfvars")
@@ -563,8 +458,8 @@ func TestRefresh_varFileDefault(t *testing.T) {
 	if !p.ConfigureCalled {
 		t.Fatal("configure should be called")
 	}
-	if p.ConfigureConfig.Config["value"].(string) != "bar" {
-		t.Fatalf("bad: %#v", p.ConfigureConfig.Config)
+	if got, want := p.ConfigureRequest.Config.GetAttr("value"), cty.StringVal("bar"); !want.RawEquals(got) {
+		t.Fatalf("wrong provider configuration\ngot:  %#v\nwant: %#v", got, want)
 	}
 }
 
@@ -582,8 +477,18 @@ func TestRefresh_varsUnset(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
+		},
+	}
+	p.GetSchemaReturn = &terraform.ProviderSchema{
+		ResourceTypes: map[string]*configschema.Block{
+			"test_instance": {
+				Attributes: map[string]*configschema.Attribute{
+					"id":  {Type: cty.String, Optional: true, Computed: true},
+					"ami": {Type: cty.String, Optional: true},
+				},
+			},
 		},
 	}
 
@@ -601,16 +506,22 @@ func TestRefresh_backup(t *testing.T) {
 	statePath := testStateFile(t, state)
 
 	// Output path
-	outf, err := ioutil.TempFile("", "tf")
+	outf, err := ioutil.TempFile(testingDir, "tf")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 	outPath := outf.Name()
-	outf.Close()
-	os.Remove(outPath)
+	defer outf.Close()
+
+	// Need to put some state content in the output file so that there's
+	// something to back up.
+	err = statefile.Write(statefile.New(state, "baz", 0), outf)
+	if err != nil {
+		t.Fatalf("error writing initial output state file %s", err)
+	}
 
 	// Backup path
-	backupf, err := ioutil.TempFile("", "tf")
+	backupf, err := ioutil.TempFile(testingDir, "tf")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -622,13 +533,18 @@ func TestRefresh_backup(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
-	p.RefreshFn = nil
-	p.RefreshReturn = newInstanceState("yes")
+	p.GetSchemaReturn = refreshFixtureSchema()
+	p.ReadResourceFn = nil
+	p.ReadResourceResponse = providers.ReadResourceResponse{
+		NewState: cty.ObjectVal(map[string]cty.Value{
+			"id": cty.StringVal("changed"),
+		}),
+	}
 
 	args := []string{
 		"-state", statePath,
@@ -640,49 +556,23 @@ func TestRefresh_backup(t *testing.T) {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
 	}
 
-	f, err := os.Open(statePath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	newState, err := terraform.ReadState(f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
+	newState := testStateRead(t, statePath)
 	if !reflect.DeepEqual(newState, state) {
 		t.Fatalf("bad: %#v", newState)
 	}
 
-	f, err = os.Open(outPath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
+	newState = testStateRead(t, outPath)
+	actual := newState.RootModule().Resources["test_instance.foo"].Instances[addrs.NoKey].Current
+	expected := &states.ResourceInstanceObjectSrc{
+		Status:       states.ObjectReady,
+		AttrsJSON:    []byte("{\n            \"ami\": null,\n            \"id\": \"changed\"\n          }"),
+		Dependencies: []addrs.Referenceable{},
 	}
-
-	newState, err = terraform.ReadState(f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	actual := newState.RootModule().Resources["test_instance.foo"].Primary
-	expected := p.RefreshReturn
 	if !reflect.DeepEqual(actual, expected) {
-		t.Fatalf("bad: %#v", actual)
+		t.Fatalf("wrong new object\ngot:  %swant: %s", spew.Sdump(actual), spew.Sdump(expected))
 	}
 
-	f, err = os.Open(backupPath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	backupState, err := terraform.ReadState(f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
+	backupState := testStateRead(t, backupPath)
 	actualStr := strings.TrimSpace(backupState.String())
 	expectedStr := strings.TrimSpace(state.String())
 	if actualStr != expectedStr {
@@ -695,7 +585,7 @@ func TestRefresh_disableBackup(t *testing.T) {
 	statePath := testStateFile(t, state)
 
 	// Output path
-	outf, err := ioutil.TempFile("", "tf")
+	outf, err := ioutil.TempFile(testingDir, "tf")
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -707,13 +597,18 @@ func TestRefresh_disableBackup(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
 		},
 	}
 
-	p.RefreshFn = nil
-	p.RefreshReturn = newInstanceState("yes")
+	p.GetSchemaReturn = refreshFixtureSchema()
+	p.ReadResourceFn = nil
+	p.ReadResourceResponse = providers.ReadResourceResponse{
+		NewState: cty.ObjectVal(map[string]cty.Value{
+			"id": cty.StringVal("yes"),
+		}),
+	}
 
 	args := []string{
 		"-state", statePath,
@@ -725,36 +620,20 @@ func TestRefresh_disableBackup(t *testing.T) {
 		t.Fatalf("bad: %d\n\n%s", code, ui.ErrorWriter.String())
 	}
 
-	f, err := os.Open(statePath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	newState, err := terraform.ReadState(f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
+	newState := testStateRead(t, statePath)
 	if !reflect.DeepEqual(newState, state) {
 		t.Fatalf("bad: %#v", newState)
 	}
 
-	f, err = os.Open(outPath)
-	if err != nil {
-		t.Fatalf("err: %s", err)
+	newState = testStateRead(t, outPath)
+	actual := newState.RootModule().Resources["test_instance.foo"].Instances[addrs.NoKey].Current
+	expected := &states.ResourceInstanceObjectSrc{
+		Status:       states.ObjectReady,
+		AttrsJSON:    []byte("{\n            \"ami\": null,\n            \"id\": \"yes\"\n          }"),
+		Dependencies: []addrs.Referenceable{},
 	}
-
-	newState, err = terraform.ReadState(f)
-	f.Close()
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-
-	actual := newState.RootModule().Resources["test_instance.foo"].Primary
-	expected := p.RefreshReturn
 	if !reflect.DeepEqual(actual, expected) {
-		t.Fatalf("bad: %#v", actual)
+		t.Fatalf("wrong new object\ngot:  %swant: %s", spew.Sdump(actual), spew.Sdump(expected))
 	}
 
 	// Ensure there is no backup
@@ -776,8 +655,18 @@ func TestRefresh_displaysOutputs(t *testing.T) {
 	ui := new(cli.MockUi)
 	c := &RefreshCommand{
 		Meta: Meta{
-			ContextOpts: testCtxConfig(p),
-			Ui:          ui,
+			testingOverrides: metaOverridesForProvider(p),
+			Ui:               ui,
+		},
+	}
+	p.GetSchemaReturn = &terraform.ProviderSchema{
+		ResourceTypes: map[string]*configschema.Block{
+			"test_instance": {
+				Attributes: map[string]*configschema.Attribute{
+					"id":  {Type: cty.String, Optional: true, Computed: true},
+					"ami": {Type: cty.String, Optional: true},
+				},
+			},
 		},
 	}
 
@@ -797,17 +686,57 @@ func TestRefresh_displaysOutputs(t *testing.T) {
 	}
 }
 
-// When creating an InstaneState for direct comparison to one contained in
-// terraform.State, all fields must be initialized (duplicating the
-// InstanceState.init() method)
-func newInstanceState(id string) *terraform.InstanceState {
-	return &terraform.InstanceState{
-		ID:         id,
-		Attributes: make(map[string]string),
-		Ephemeral: terraform.EphemeralState{
-			ConnInfo: make(map[string]string),
+// newInstanceState creates a new states.ResourceInstanceObjectSrc with the
+// given value for its single id attribute. It is named newInstanceState for
+// historical reasons, because it was originally written for the poorly-named
+// terraform.InstanceState type.
+func newInstanceState(id string) *states.ResourceInstanceObjectSrc {
+	attrs := map[string]interface{}{
+		"id": id,
+	}
+	attrsJSON, err := json.Marshal(attrs)
+	if err != nil {
+		panic(fmt.Sprintf("failed to marshal attributes: %s", err)) // should never happen
+	}
+	return &states.ResourceInstanceObjectSrc{
+		AttrsJSON: attrsJSON,
+		Status:    states.ObjectReady,
+	}
+}
+
+// refreshFixtureSchema returns a schema suitable for processing the
+// configuration in test-fixtures/refresh . This schema should be
+// assigned to a mock provider named "test".
+func refreshFixtureSchema() *terraform.ProviderSchema {
+	return &terraform.ProviderSchema{
+		ResourceTypes: map[string]*configschema.Block{
+			"test_instance": {
+				Attributes: map[string]*configschema.Attribute{
+					"id":  {Type: cty.String, Optional: true, Computed: true},
+					"ami": {Type: cty.String, Optional: true},
+				},
+			},
 		},
-		Meta: make(map[string]interface{}),
+	}
+}
+
+// refreshVarFixtureSchema returns a schema suitable for processing the
+// configuration in test-fixtures/refresh-var . This schema should be
+// assigned to a mock provider named "test".
+func refreshVarFixtureSchema() *terraform.ProviderSchema {
+	return &terraform.ProviderSchema{
+		Provider: &configschema.Block{
+			Attributes: map[string]*configschema.Attribute{
+				"value": {Type: cty.String, Optional: true},
+			},
+		},
+		ResourceTypes: map[string]*configschema.Block{
+			"test_instance": {
+				Attributes: map[string]*configschema.Attribute{
+					"id": {Type: cty.String, Optional: true, Computed: true},
+				},
+			},
+		},
 	}
 }
 
@@ -818,8 +747,10 @@ foo = "bar"
 const testRefreshStr = `
 test_instance.foo:
   ID = yes
+  provider = provider.test
 `
 const testRefreshCwdStr = `
 test_instance.foo:
   ID = yes
+  provider = provider.test
 `

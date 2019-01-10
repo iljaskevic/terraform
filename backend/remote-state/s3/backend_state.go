@@ -8,22 +8,23 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
+
 	"github.com/hashicorp/terraform/backend"
 	"github.com/hashicorp/terraform/state"
 	"github.com/hashicorp/terraform/state/remote"
-	"github.com/hashicorp/terraform/terraform"
+	"github.com/hashicorp/terraform/states"
 )
 
-const (
-	// This will be used as directory name, the odd looking colon is simply to
-	// reduce the chance of name conflicts with existing objects.
-	keyEnvPrefix = "env:"
-)
+func (b *Backend) Workspaces() ([]string, error) {
+	prefix := b.workspaceKeyPrefix + "/"
 
-func (b *Backend) States() ([]string, error) {
+	// List bucket root if there is no workspaceKeyPrefix
+	if b.workspaceKeyPrefix == "" {
+		prefix = ""
+	}
 	params := &s3.ListObjectsInput{
 		Bucket: &b.bucketName,
-		Prefix: aws.String(keyEnvPrefix + "/"),
+		Prefix: aws.String(prefix),
 	}
 
 	resp, err := b.s3Client.ListObjects(params)
@@ -31,29 +32,42 @@ func (b *Backend) States() ([]string, error) {
 		return nil, err
 	}
 
-	envs := []string{backend.DefaultStateName}
+	wss := []string{backend.DefaultStateName}
 	for _, obj := range resp.Contents {
-		env := b.keyEnv(*obj.Key)
-		if env != "" {
-			envs = append(envs, env)
+		ws := b.keyEnv(*obj.Key)
+		if ws != "" {
+			wss = append(wss, ws)
 		}
 	}
 
-	sort.Strings(envs[1:])
-	return envs, nil
+	sort.Strings(wss[1:])
+	return wss, nil
 }
 
-// extract the env name from the S3 key
 func (b *Backend) keyEnv(key string) string {
-	// we have 3 parts, the prefix, the env name, and the key name
-	parts := strings.SplitN(key, "/", 3)
-	if len(parts) < 3 {
-		// no env here
+	if b.workspaceKeyPrefix == "" {
+		parts := strings.SplitN(key, "/", 2)
+		if len(parts) > 1 && parts[1] == b.keyName {
+			return parts[0]
+		} else {
+			return ""
+		}
+	}
+
+	parts := strings.SplitAfterN(key, b.workspaceKeyPrefix, 2)
+
+	if len(parts) < 2 {
 		return ""
 	}
 
 	// shouldn't happen since we listed by prefix
-	if parts[0] != keyEnvPrefix {
+	if parts[0] != b.workspaceKeyPrefix {
+		return ""
+	}
+
+	parts = strings.SplitN(parts[1], "/", 3)
+
+	if len(parts) < 3 {
 		return ""
 	}
 
@@ -65,25 +79,21 @@ func (b *Backend) keyEnv(key string) string {
 	return parts[1]
 }
 
-func (b *Backend) DeleteState(name string) error {
+func (b *Backend) DeleteWorkspace(name string) error {
 	if name == backend.DefaultStateName || name == "" {
 		return fmt.Errorf("can't delete default state")
 	}
 
-	params := &s3.DeleteObjectInput{
-		Bucket: &b.bucketName,
-		Key:    aws.String(b.path(name)),
-	}
-
-	_, err := b.s3Client.DeleteObject(params)
+	client, err := b.remoteClient(name)
 	if err != nil {
 		return err
 	}
 
-	return nil
+	return client.Delete()
 }
 
-func (b *Backend) State(name string) (state.State, error) {
+// get a remote client configured for this state
+func (b *Backend) remoteClient(name string) (*RemoteClient, error) {
 	if name == "" {
 		return nil, errors.New("missing state name")
 	}
@@ -99,8 +109,16 @@ func (b *Backend) State(name string) (state.State, error) {
 		ddbTable:             b.ddbTable,
 	}
 
-	stateMgr := &remote.State{Client: client}
+	return client, nil
+}
 
+func (b *Backend) StateMgr(name string) (state.State, error) {
+	client, err := b.remoteClient(name)
+	if err != nil {
+		return nil, err
+	}
+
+	stateMgr := &remote.State{Client: client}
 	// Check to see if this state already exists.
 	// If we're trying to force-unlock a state, we can't take the lock before
 	// fetching the state. If the state doesn't exist, we have to assume this
@@ -109,7 +127,7 @@ func (b *Backend) State(name string) (state.State, error) {
 	// If we need to force-unlock, but for some reason the state no longer
 	// exists, the user will have to use aws tools to manually fix the
 	// situation.
-	existing, err := b.States()
+	existing, err := b.Workspaces()
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +168,7 @@ func (b *Backend) State(name string) (state.State, error) {
 
 		// If we have no state, we have to create an empty state
 		if v := stateMgr.State(); v == nil {
-			if err := stateMgr.WriteState(terraform.NewState()); err != nil {
+			if err := stateMgr.WriteState(states.NewState()); err != nil {
 				err = lockUnlock(err)
 				return nil, err
 			}
@@ -179,7 +197,12 @@ func (b *Backend) path(name string) string {
 		return b.keyName
 	}
 
-	return strings.Join([]string{keyEnvPrefix, name, b.keyName}, "/")
+	if b.workspaceKeyPrefix != "" {
+		return strings.Join([]string{b.workspaceKeyPrefix, name, b.keyName}, "/")
+	} else {
+		// Trim the leading / for no workspace prefix
+		return strings.Join([]string{b.workspaceKeyPrefix, name, b.keyName}, "/")[1:]
+	}
 }
 
 const errStateUnlock = `

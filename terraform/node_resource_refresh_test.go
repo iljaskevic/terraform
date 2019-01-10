@@ -1,21 +1,19 @@
 package terraform
 
 import (
-	"sync"
+	"reflect"
 	"testing"
+
+	"github.com/davecgh/go-spew/spew"
+	"github.com/zclconf/go-cty/cty"
+
+	"github.com/hashicorp/terraform/addrs"
 )
 
 func TestNodeRefreshableManagedResourceDynamicExpand_scaleOut(t *testing.T) {
-	var stateLock sync.RWMutex
-
-	addr, err := ParseResourceAddress("aws_instance.foo")
-	if err != nil {
-		t.Fatalf("bad: %s", err)
-	}
-
 	m := testModule(t, "refresh-resource-scale-inout")
 
-	state := &State{
+	state := MustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -39,31 +37,38 @@ func TestNodeRefreshableManagedResourceDynamicExpand_scaleOut(t *testing.T) {
 				},
 			},
 		},
-	}
+	}).SyncWrapper()
 
 	n := &NodeRefreshableManagedResource{
-		NodeAbstractCountResource: &NodeAbstractCountResource{
-			NodeAbstractResource: &NodeAbstractResource{
-				Addr:   addr,
-				Config: m.Config().Resources[0],
-			},
+		NodeAbstractResource: &NodeAbstractResource{
+			Addr: addrs.RootModuleInstance.Resource(
+				addrs.ManagedResourceMode, "aws_instance", "foo",
+			),
+			Config: m.Module.ManagedResources["aws_instance.foo"],
 		},
 	}
 
 	g, err := n.DynamicExpand(&MockEvalContext{
-		PathPath:   []string{"root"},
+		PathPath:   addrs.RootModuleInstance,
 		StateState: state,
-		StateLock:  &stateLock,
+
+		// DynamicExpand will call EvaluateExpr to evaluate the "count"
+		// expression, which is just a literal number 3 in the fixture config
+		// and so we'll just hard-code this here too.
+		EvaluateExprResult: cty.NumberIntVal(3),
 	})
+	if err != nil {
+		t.Fatalf("error attempting DynamicExpand: %s", err)
+	}
 
 	actual := g.StringWithNodeTypes()
 	expected := `aws_instance.foo[0] - *terraform.NodeRefreshableManagedResourceInstance
 aws_instance.foo[1] - *terraform.NodeRefreshableManagedResourceInstance
-aws_instance.foo[2] - *terraform.NodePlannableResourceInstance
+aws_instance.foo[2] - *terraform.NodeRefreshableManagedResourceInstance
 root - terraform.graphNodeRoot
   aws_instance.foo[0] - *terraform.NodeRefreshableManagedResourceInstance
   aws_instance.foo[1] - *terraform.NodeRefreshableManagedResourceInstance
-  aws_instance.foo[2] - *terraform.NodePlannableResourceInstance
+  aws_instance.foo[2] - *terraform.NodeRefreshableManagedResourceInstance
 `
 	if expected != actual {
 		t.Fatalf("Expected:\n%s\nGot:\n%s", expected, actual)
@@ -71,16 +76,9 @@ root - terraform.graphNodeRoot
 }
 
 func TestNodeRefreshableManagedResourceDynamicExpand_scaleIn(t *testing.T) {
-	var stateLock sync.RWMutex
-
-	addr, err := ParseResourceAddress("aws_instance.foo")
-	if err != nil {
-		t.Fatalf("bad: %s", err)
-	}
-
 	m := testModule(t, "refresh-resource-scale-inout")
 
-	state := &State{
+	state := MustShimLegacyState(&State{
 		Modules: []*ModuleState{
 			&ModuleState{
 				Path: rootModulePath,
@@ -120,23 +118,29 @@ func TestNodeRefreshableManagedResourceDynamicExpand_scaleIn(t *testing.T) {
 				},
 			},
 		},
-	}
+	}).SyncWrapper()
 
 	n := &NodeRefreshableManagedResource{
-		NodeAbstractCountResource: &NodeAbstractCountResource{
-			NodeAbstractResource: &NodeAbstractResource{
-				Addr:   addr,
-				Config: m.Config().Resources[0],
-			},
+		NodeAbstractResource: &NodeAbstractResource{
+			Addr: addrs.RootModuleInstance.Resource(
+				addrs.ManagedResourceMode, "aws_instance", "foo",
+			),
+			Config: m.Module.ManagedResources["aws_instance.foo"],
 		},
 	}
 
 	g, err := n.DynamicExpand(&MockEvalContext{
-		PathPath:   []string{"root"},
+		PathPath:   addrs.RootModuleInstance,
 		StateState: state,
-		StateLock:  &stateLock,
-	})
 
+		// DynamicExpand will call EvaluateExpr to evaluate the "count"
+		// expression, which is just a literal number 3 in the fixture config
+		// and so we'll just hard-code this here too.
+		EvaluateExprResult: cty.NumberIntVal(3),
+	})
+	if err != nil {
+		t.Fatalf("error attempting DynamicExpand: %s", err)
+	}
 	actual := g.StringWithNodeTypes()
 	expected := `aws_instance.foo[0] - *terraform.NodeRefreshableManagedResourceInstance
 aws_instance.foo[1] - *terraform.NodeRefreshableManagedResourceInstance
@@ -150,5 +154,28 @@ root - terraform.graphNodeRoot
 `
 	if expected != actual {
 		t.Fatalf("Expected:\n%s\nGot:\n%s", expected, actual)
+	}
+}
+
+func TestNodeRefreshableManagedResourceEvalTree_scaleOut(t *testing.T) {
+	m := testModule(t, "refresh-resource-scale-inout")
+
+	n := &NodeRefreshableManagedResourceInstance{
+		NodeAbstractResourceInstance: &NodeAbstractResourceInstance{
+			NodeAbstractResource: NodeAbstractResource{
+				Addr: addrs.RootModuleInstance.Resource(
+					addrs.ManagedResourceMode, "aws_instance", "foo",
+				),
+				Config: m.Module.ManagedResources["aws_instance.foo"],
+			},
+			InstanceKey: addrs.IntKey(2),
+		},
+	}
+
+	actual := n.EvalTree()
+	expected := n.evalTreeManagedResourceNoState()
+
+	if !reflect.DeepEqual(expected, actual) {
+		t.Fatalf("Expected:\n\n%s\nGot:\n\n%s\n", spew.Sdump(expected), spew.Sdump(actual))
 	}
 }
